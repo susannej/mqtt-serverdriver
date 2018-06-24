@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+
+# PROVIDE: serverdriver
+# REQUIRE: mosquitto
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+
+#
+# Add the following lines to /etc/rc.conf to enable fhem:
+#
+# serverdriver_enable="YES"
+#
+
+. /etc/rc.subr
+
+name=serverdriver
+rcvar=serverdriver_enable
+
+command="/usr/local/bin/${name}"
+command_args="-d"
+command_interpreter=/usr/local/bin/perl
+pidfile="/var/run/${name}.pid"
+
+stop_cmd=${name}_stop
+
+serverdriver_stop() {
+	if [ -e $pidfile ]; then
+		pid=`cat ${pidfile}`
+		kill -9 `pgrep -P ${pid}`
+		kill -9 `cat ${pidfile}`
+		rm /var/run/${name}.pid
+	else
+		echo ${name} is not running!
+	fi
+}
+
+load_rc_config $name
+run_rc_command "$1"

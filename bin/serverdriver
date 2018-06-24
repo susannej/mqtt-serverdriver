@@ -1,0 +1,259 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Basename;
+use Net::MQTT::Simple;
+
+my %config;
+my %args;
+
+sub print_help();
+sub set_default_config();
+sub set_configfile_config();
+sub set_parameter_config();
+sub print_config();
+sub set_user();
+
+my $optsOk = getopts('c:dhl:p:u:', \%args);
+my $scriptname = basename("${0}");
+
+if ($args{h} || !$optsOk) {
+	print_help();
+	exit;
+}
+
+set_default_config();
+set_configfile_config();
+set_parameter_config();
+
+if ($config{logfile}) {
+	open(STDERR, ">>$config{logfile}");
+}
+
+print_config();
+
+if ($args{d}) {
+	my $pid = fork;
+
+	if ($pid) {
+		print "Running as a daemon!\n";
+		open(PIDFILE, '>', $config{pidfile}) or die $!;
+		print PIDFILE $pid;
+		close(PIDFILE);
+		exit;
+	}
+}
+
+set_user();
+
+my $current_order = "";
+my $switch_offline_time;
+
+my $second_serv = fork;
+if ($second_serv) {
+	my $mqttPing = Net::MQTT::Simple->new($config{mqttserver});
+	
+	while(1) {
+		system("ping -c 1 $config{server_stat_online_ip} > /dev/null 2>&1");
+		my $erg = $? >> 8;
+		warn "ping system-rc = $erg\n";
+		if ($erg == 0) {
+			warn "ping = ON\n";
+			$mqttPing->retain($config{topic_server_stat_online} => "ON");
+		} else {
+			warn "ping = OFF\n";
+			$mqttPing->retain($config{topic_server_stat_online} => "OFF");
+		}
+		sleep 20;
+	}
+} else {
+	my $mqtt = Net::MQTT::Simple->new($config{mqttserver});
+
+	$mqtt->run (
+		"$config{topic_server_cmnd_power}" => sub {
+	
+                	my ($topic, $message) = @_;
+                	warn "Got: [$topic] = $message\n";
+                	if ($message eq "ON" && $current_order eq "") {
+                               	$mqtt->retain($config{topic_server_stat_power} => "starting");
+				$mqtt->publish($config{topic_plug_cmnd_power} => "ON");
+				$current_order = "start";
+                	}
+                	if ($message eq "OFF" && $current_order eq "") {
+                                $mqtt->retain($config{topic_server_stat_power} => "shutdown");
+
+				system($config{server_poweroff_cmnd});
+				my $ssh_erg = $? >> 8;
+				warn "shutdown system-rc = $ssh_erg\n";
+
+				$current_order = "stop";
+                	}
+        	},
+		"$config{topic_server_stat_online}" => sub {
+                	my ($topic, $message) = @_;
+                	warn "Got: [$topic] = $message\n";
+			if ($current_order eq "start" && $message eq "ON") {
+				warn "Setting Server-POWER to ON\n";
+                               	$mqtt->retain($config{topic_server_stat_power} => "ON");
+				$current_order = "";
+			}
+			if ($current_order eq "stop" && $message eq "OFF") {
+				if (!$switch_offline_time) {
+					$switch_offline_time = time();
+				} else {
+					my $current_time = time();
+					if (($switch_offline_time + 120) < $current_time) {
+						warn "Setting Server-POWER to OFF\n";
+                               			$mqtt->retain($config{topic_server_stat_power} => "OFF");
+						warn "Setting Steckdose  to OFF\n";
+						$mqtt->publish($config{topic_plug_cmnd_power} => "OFF");
+						$current_order = "";
+						$switch_offline_time = undef;
+					}
+				}
+			}
+		}
+	);
+}
+
+if (-e $config{pidfile}) {
+	unlink $config{pidfile};
+}
+
+sub print_help() {
+	print "\nusage: ${scriptname} [options]\n";
+	print "\n";
+	print "\t-c <config-file>\n";
+	print "\t   use the specified config file.\n";
+	print "\t   example: -c /usr/local/etc/${scriptname}.conf\n";
+	print "\n";
+	print "\t-d\n";
+	print "\t   run the program as a daemon\n";
+	print "\n";
+	print "\t-h\n";
+	print "\t   display this help information\n";
+	print "\n";
+	print "\t-l <log-file>\n";
+	print "\t   use the specified log file.\n";
+	print "\t   example: -c /var/log/${scriptname}.log\n";
+	print "\n";
+	print "\t-p <pid-file>\n";
+	print "\t   use the specified file for storing the process-id.\n";
+	print "\t   example: -p /var/run/${scriptname}.pid\n";
+	print "\n";
+	print "\t-u <username>\n";
+	print "\t   use the specified user for running this script.\n";
+	print "\t   example: -u fhem\n";
+	print "\n";
+}
+
+sub set_default_config() {
+	if($args{c}) { 
+		$config{configfile} = $args{c};
+	} elsif (-e "/usr/local/etc/${scriptname}.conf") {
+		$config{configfile} = "/usr/local/etc/${scriptname}.conf";
+	} elsif (-e "/etc/${scriptname}.conf") {
+		$config{configfile} = "/etc/${scriptname}.conf";
+	}
+
+	$config{logfile} = "/var/log/${scriptname}.log";
+	$config{pidfile} = "/var/run/${scriptname}.pid";
+	$config{mqttserver} = "localhost";
+	$config{user} = "fhem";
+	$config{server_stat_online_ip} = "192.168.1.1";
+	$config{server_poweroff_cmnd} = "ssh fhem\@192.168.1.1 /sbin/poweroff >> /dev/null 2>&1";
+	$config{topic_server_stat_online} = "smartHome/computer/server/stat/ONLINE";
+	$config{topic_server_stat_power} = "smartHome/computer/server/stat/POWER";
+	$config{topic_server_cmnd_power} = "smartHome/computer/server/cmnd/POWER";
+	$config{topic_plug_cmnd_power} = "smartHome/wallPlug/Sonoff-S20-01/cmnd/POWER";
+}
+
+sub set_configfile_config() {
+	if ($config{configfile}) {
+		my $cfh;
+		open ($cfh, '<',  $config{configfile}) or die "Could not open ConfigFile: '$config{configfile}' $!";
+
+		while (<$cfh>) {
+			chomp;
+			if (!/^\s*#/ && !/^\s*$/) {
+				my @field = split(/ /);
+				
+				if ($field[0] eq "runmode") {
+					if ($field[1] eq "daemon") {
+						$config{d} = 1;
+					}
+				} else {
+					my $line = $_;
+					$line =~ s/^$field[0] +//;
+					$config{$field[0]} = $line;
+				}
+			}
+		}
+
+		close $cfh;
+	}
+}
+
+sub set_parameter_config() {
+	if($args{l}) {
+		$config{logfile} = $args{l};
+	}
+	if($args{p}) {
+		$config{pidfile} = $args{p};
+	}
+	if($args{u}) {
+		$config{user} = $args{u};
+	}
+}
+
+sub print_config() {
+	warn "Starting serverdriver...\n";
+	warn "using configuration:\n\n";
+	foreach my $key ( keys %config ) {
+		my $value;
+		if ($key eq "d") {
+			if ($config{daemon} == 1) {
+				$value = "true";
+			} else {
+				$value = "false";
+			}
+			warn "daemon = $value\n";
+		} else {
+			$value = $config{$key};
+			warn "$key = $value\n";
+		}
+	}
+	warn "\n";
+}
+
+sub set_user() {
+
+	#
+	# from fhem.pl
+	#
+
+	my @pw = getpwnam($config{user});
+	if(@pw) {
+		use POSIX qw(setuid setgid);
+	
+		# set primary group
+		setgid($pw[3]);
+	
+		# read all secondary groups into an array:
+		my @groups;
+		while ( my ($name, $pw, $gid, $members) = getgrent() ) {
+			push(@groups, $gid) if ( grep($_ eq $pw[0],split(/\s+/,$members)) );
+		}
+	
+		# set the secondary groups via $)
+		if (@groups) {
+			$) = "$pw[3] ".join(" ",@groups);
+		} else {
+			$) = "$pw[3] $pw[3]";
+		}
+	
+		setuid($pw[2]);
+	}
+}
